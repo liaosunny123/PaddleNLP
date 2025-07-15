@@ -40,26 +40,27 @@ TRAIN_ARGS="
 "
 
 # [seq_length] [num_hidden_layers]
-MODEL_ARGS=(
-    --model_name_or_path "llama"
-    --num_hidden_layers 8
-    --intermediate_size 11008
-    --vocab_size 32000
-    --hidden_size 4096
-    --seq_length 1024
-    --num_attention_heads 32
-)
-#   --no_recompute_layers 3 7 11
+MODEL_ARGS="
+    --model_name_or_path "llama" \
+    --num_hidden_layers 4 \
+    --intermediate_size 11008 \
+    --vocab_size 32000 \
+    --hidden_size 4096 \
+    --seq_length 1024 \
+    --num_attention_heads 32 \
+    --no_recompute_layers 1 2 \
+"
 
 # [mbsz, accumulation_steps] [recompute] [amp]
 CONFIG_ARGS="
-    --per_device_train_batch_size 4 \
-    --gradient_accumulation_steps 8 \
-    --recompute false \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --recompute true \
     --recompute_use_reentrant true \
     --recompute_granularity full \
     --pp_recompute_interval 0 \
     --bf16 true \
+    --fp16_opt_level "O1" \
     --fp16_opt_level "O1" \
     --amp_master_grad false \
     --amp_custom_black_list "reduce_sum" "c_softmax_with_cross_entropy" \
@@ -69,9 +70,9 @@ CONFIG_ARGS="
 # [dp_deg, dp_type] [tp_deg, megatron-sp] [pp_deg, 1F1B] [parallel_configs]
 PARALLEL_ARGS=(
     --to_static 1
-    --sharding_parallel_degree 1
+    --sharding_parallel_degree 4
     --sharding "stage2"
-    --tensor_parallel_degree 8
+    --tensor_parallel_degree 2
     --sequence_parallel true
     --pipeline_parallel_degree 1
     --virtual_pp_degree 1

@@ -2324,7 +2324,7 @@ class TrainingArguments:
         if self.enable_auto_parallel:
             return False
         return (
-            ShardingOption.SHARD_OP in self.sharding and self.sharding_parallel_degree > 1 and self.save_sharded_model
+            ShardingOption.SHARD_OP.value in self.sharding and self.sharding_parallel_degree > 1 and self.save_sharded_model
         )
 
     @property
@@ -2332,7 +2332,7 @@ class TrainingArguments:
         if self.enable_auto_parallel:
             return False
         return (
-            ShardingOption.SHARD_OP in self.sharding and self.sharding_parallel_degree > 1 and self.load_sharded_model
+            ShardingOption.SHARD_OP.value in self.sharding and self.sharding_parallel_degree > 1 and self.load_sharded_model
         )
 
     @property
@@ -2458,7 +2458,7 @@ class TrainingArguments:
         return (
             self.enable_auto_parallel
             and self.to_static
-            and ShardingOption.SHARD_OP in self.sharding
+            and ShardingOption.SHARD_OP.value in self.sharding
             and self.sharding_parallel_degree > 1
             and "enable_tensor_fusion" in self.sharding_parallel_config
         )

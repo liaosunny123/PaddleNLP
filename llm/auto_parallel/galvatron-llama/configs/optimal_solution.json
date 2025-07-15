@@ -1,10 +1,85 @@
 {
-    "bsz": 128,
-    "accumulation_steps": 4,
-    "strategy": "pp1_tp2_dp4_stage2_recompute0",
-    "memory_cost": [
-        32967.3158100586
-    ],
-    "time_cost": 2.0981547411655526,
-    "throughput": 61.00598658843166
+    "optimization_target": "throughput",
+    "search_timestamp": "2025-07-22T20:51:26.300382",
+    "model_config": {
+        "total_layers": 16,
+        "world_size": 8,
+        "memory_limit_gb": 36,
+        "mixed_precision": "bf16"
+    },
+    "optimal_solution": {
+        "batch_size": 128,
+        "accumulation_steps": 2,
+        "micro_batch_size": 64,
+        "global_batch_size": 128
+    },
+    "strategy": {
+        "pp_size": 1,
+        "tp_size": 1,
+        "dp_size": 8,
+        "sharding_stage": 2,
+        "recompute": 0,
+        "strategy_name": "pp1_tp1_dp8_stage2_recompute0",
+        "layerwise_recompute": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        ],
+        "layerwise_recompute_layers": [],
+        "layerwise_no_recompute_layers": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+        ],
+        "recompute_layers_count": 0,
+        "no_recompute_layers_count": 16,
+        "recompute_ratio": 0.0
+    },
+    "performance_metrics": {
+        "throughput_samples_per_sec": 42.78916053726379,
+        "time_cost_seconds": 2.9914118059999955,
+        "memory_cost_mb": [
+            31586.8945390625
+        ],
+        "memory_usage_gb": 30.85,
+        "memory_efficiency_percent": 85.7
+    },
+    "recompute_analysis": {
+        "enabled": false,
+        "reason": "Sufficient memory available - no recompute needed for optimal performance"
+    },
+    "optimal_recompute_summary": {
+        "enabled": false,
+        "total_layers": 16,
+        "recompute_layers_count": 0,
+        "recompute_ratio": "0.0%",
+        "memory_vs_compute_tradeoff": "Using 0 out of 16 layers for recompute saves memory at cost of 0.0% additional computation",
+        "efficiency_explanation": "No recompute - maximum performance"
+    }
 }

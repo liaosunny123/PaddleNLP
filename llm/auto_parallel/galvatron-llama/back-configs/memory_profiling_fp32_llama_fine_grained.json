@@ -1,0 +1,28 @@
+{
+    "layertype_0": {
+        "1024": {
+            "parameter_size": -1,
+            "tp_activation_per_bsz_dict": {
+                "checkpoint": -1
+            }
+        }
+    },
+    "other_memory_pp_off": {
+        "1024": {
+            "model_states": {},
+            "activation": {}
+        }
+    },
+    "other_memory_pp_on_first": {
+        "1024": {
+            "model_states": {},
+            "activation": {}
+        }
+    },
+    "other_memory_pp_on_last": {
+        "1024": {
+            "model_states": {},
+            "activation": {}
+        }
+    }
+}

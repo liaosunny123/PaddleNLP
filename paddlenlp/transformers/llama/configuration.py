@@ -95,7 +95,8 @@ class LlamaConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         tie_word_embeddings(`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
-            Enable rope fusion or not.
+        use_fast_layer_norm (`bool`, *optional*, defaults to `False`):
+            Whether to use fast layer normalization in fused RMS norm operations.
         num_key_value_heads (`int`, *optional*):
             This is the number of key_value heads that should be used to implement Grouped Query Attention. If
             `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
@@ -144,6 +145,7 @@ class LlamaConfig(PretrainedConfig):
         use_cache=True,
         fuse_attention_qkv=False,
         fuse_attention_ffn=False,
+        use_fast_layer_norm=False,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
@@ -180,6 +182,7 @@ class LlamaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.fuse_attention_qkv = fuse_attention_qkv
         self.fuse_attention_ffn = fuse_attention_ffn
+        self.use_fast_layer_norm = use_fast_layer_norm
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id

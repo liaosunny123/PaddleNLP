@@ -35,6 +35,12 @@ class Strategy:
     sharding_stage: int = field(default=0, metadata={"help": "The stage of sharding. 0: no sharding, 1: sharding1, 2: sharding2, 3: sharding3"})
     recompute: int = field(default=0, metadata={"help": "Whether to use recompute."})
     
+    # Fine-grained recompute parameters
+    recompute_granularity: str = field(default="full", metadata={"help": "Recompute granularity: full, core_attn, full_attn"})
+    no_recompute_layers: List[int] = field(default_factory=list, metadata={"help": "Layers to exclude from recompute"})
+    pp_recompute_interval: int = field(default=0, metadata={"help": "Pipeline recompute interval"})
+    layerwise_recompute: List[int] = field(default_factory=list, metadata={"help": "Layer-wise recompute pattern: [0,1,1,0] means layer 0,3 no recompute, layer 1,2 recompute"})
+    
     def serialize(self):
         text = f'pp{self.pp_size}_tp{self.tp_size}_dp{self.dp_size}_stage{self.sharding_stage}_recompute{self.recompute}'
         return text

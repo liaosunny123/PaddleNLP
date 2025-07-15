@@ -5,7 +5,7 @@ ProfileDataParserArgs="
     --memory_profile_mode static \
     --num_layertype 1 \
     --hidden_size_list 4096 \
-    --layernum_list 16 \
+    --layernum_list 8 \
     --seqlen_list 1024 \
     --profile_gpu_num 8 \
     --time_profile_data_path ./configs/computation_profiling_bf16_llama_rank[0].json \

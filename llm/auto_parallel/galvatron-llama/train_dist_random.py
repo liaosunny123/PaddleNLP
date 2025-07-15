@@ -305,7 +305,9 @@ def init_seed(seed: int = 1234, args=None):
 
             global_seed, local_seed, random_seed = _get_distributed_seeds(args.seed, topo)
 
+            random_seed = random_seed.item()
             paddle.seed(local_seed)
+            print(f"DEBUG: random_seed = {random_seed}, type = {type(random_seed)}")
             random.seed(random_seed)
             np.random.seed(random_seed)
 

@@ -1,5 +1,5 @@
 {
-    "allreduce_size_8": 154.582,
-    "allreduce_size_4": 160.967,
-    "allreduce_size_2": 153.493
+    "allreduce_size_8": 32.82769012451172,
+    "allreduce_size_4": 40.97300338745117,
+    "allreduce_size_2": 34.18164825439453
 }

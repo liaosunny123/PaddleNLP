@@ -1,0 +1,48 @@
+{
+    "optimization_target": "throughput",
+    "search_timestamp": "2025-07-09T14:55:40.389209",
+    "model_config": {
+        "total_layers": 4,
+        "world_size": 4,
+        "memory_limit_gb": 18,
+        "mixed_precision": "bf16"
+    },
+    "optimal_solution": {
+        "batch_size": 9,
+        "accumulation_steps": 1,
+        "micro_batch_size": 9,
+        "global_batch_size": 9
+    },
+    "strategy": {
+        "pp_size": 1,
+        "tp_size": 1,
+        "dp_size": 4,
+        "sharding_stage": 3,
+        "recompute": 0,
+        "strategy_name": "pp1_tp1_dp4_stage3_recompute0",
+        "layerwise_recompute": [],
+        "layerwise_recompute_layers": [],
+        "layerwise_no_recompute_layers": []
+    },
+    "performance_metrics": {
+        "throughput_samples_per_sec": 42.36593315014709,
+        "time_cost_seconds": 0.7553238562358657,
+        "memory_cost_mb": [
+            5939.37
+        ],
+        "memory_usage_gb": 5.800166015625,
+        "memory_efficiency_percent": 87.4
+    },
+    "recompute_analysis": {
+        "enabled": false,
+        "reason": "Sufficient memory available - no recompute needed for optimal performance"
+    },
+    "memory_fix_applied": {
+        "timestamp": "2025-07-09T14:52:00.000000",
+        "reason": "Cross-entropy memory overhead for large vocab_size",
+        "original_micro_batch_size": 32,
+        "fixed_micro_batch_size": 9,
+        "cross_entropy_memory_gb": 1.373291015625,
+        "batch_size_reduction_factor": 3.5555555555555554
+    }
+}

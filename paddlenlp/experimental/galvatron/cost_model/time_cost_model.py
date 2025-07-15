@@ -6,7 +6,7 @@ from typing import Optional, Union, List
 @dataclass
 class TimeCostModelArguments:
     # initialize from scripts, config files, command line args or manual code.
-    strategy: Strategy = field(default=None, metadata={"help": "The strategy of the model."})
+    strategy: Strategy = field(default_factory=lambda: Strategy(), metadata={"help": "The strategy of the model."})
     global_batch_size: int = field(default=8, metadata={"help": "The global batch size of the model."})  # 这个地方应该是micro_batch_size
     mixed_precision_type: str = field(default='fp16', metadata={"help": "The mixed precision type of the model."})
     seq_length: int = field(default=1024, metadata={"help": "The sequence length of the model."})
@@ -17,8 +17,8 @@ class TimeCostModelArguments:
     parameter_memory: Optional[Union[float, np.ndarray]] = field(default=0.0, metadata={"help": "The parameter memory of the one layer."})
     dp_overlap_coe: float = field(default=1.0, metadata={"help": "The dp overlap coefficient."})
     bct_overlap_coe: float = field(default=1.0, metadata={"help": "The bct overlap coefficient"})
-    allreduce_coe_dict: dict = field(default=None, metadata={"help": "The allreduce coefficient."})
-    p2p_coe_dict: dict = field(default=None, metadata={"help": "The p2p coefficient dictionary."})
+    allreduce_coe_dict: dict = field(default_factory=dict, metadata={"help": "The allreduce coefficient."})
+    p2p_coe_dict: dict = field(default_factory=dict, metadata={"help": "The p2p coefficient dictionary."})
     bct_fct_coe: float = field(default=2.0, metadata={"help": "The bct fct coefficient."})
     
     # some fine tune args
@@ -67,13 +67,29 @@ class TimeCostModel:
 
         self.bct = self.fct * args.bct_fct_coe
         if self.recompute:
-            self.bct += self.fct
+            # For recompute, we always use full granularity
+            # The overhead depends on how many layers are actually recomputed
+            recompute_ratio = 1.0  # Default to full recompute
+            
+            # If layerwise_recompute is available, calculate actual recompute ratio
+            if hasattr(args.strategy, 'layerwise_recompute') and args.strategy.layerwise_recompute:
+                total_layers = len(args.strategy.layerwise_recompute)
+                recompute_layers = sum(args.strategy.layerwise_recompute)
+                recompute_ratio = recompute_layers / total_layers if total_layers > 0 else 1.0
+            
+            # Apply recompute overhead based on actual recompute ratio
+            recompute_overhead = self.fct * recompute_ratio
+            self.bct += recompute_overhead
         
-        # print(f'time cost model, fct:{self.fct}, bct:{self.bct}')
+        # print(f'time cost model, fct:{self.fct}, bct:{self.bct}, granularity:{getattr(args.strategy, "recompute_granularity", "full")}')
             
     def estimate_dp_communication_cost(self):
         args = self.args
-        self.dp_message_size = 2 * (self.dp_size - 1) / self.dp_size * args.parameter_memory * args.dummy_layernum
+        parameter_memory = args.parameter_memory if args.parameter_memory is not None else 0.0
+        if isinstance(parameter_memory, np.ndarray):
+            parameter_memory = float(parameter_memory.mean())  # Use mean if it's an array
+        
+        self.dp_message_size = 2 * (self.dp_size - 1) / self.dp_size * parameter_memory * args.dummy_layernum
         if args.mixed_precision_type == 'fp16' or args.mixed_precision_type == 'bf16':
             self.dp_message_size /= 2  # [NOTE] gradient is in fp16 or bf16, so the message size is halved.
             
@@ -185,7 +201,7 @@ class OtherTimeCostModelArguments:
     other_memory_pp_on:dict = field(default_factory=lambda: {'first_stage':{'model_states': 640, 'activation': 320}, 'last_stage':{'model_states': 640, 'activation': 320}})
     other_time_profiled: Optional[Union[float, np.ndarray]] = field(default=0.0, metadata={"help": "The other time profile of the model."})
 
-    allreduce_coe_dict: dict = field(default=None, metadata={"help": "The allreduce coefficient."})
+    allreduce_coe_dict: dict = field(default_factory=dict, metadata={"help": "The allreduce coefficient."})
     bct_fct_coe: float = field(default=2, metadata={"help": "The bct fct coefficient."})
     dp_overlap_coe: float = field(default=1.0, metadata={"help": "The dp overlap coefficient."})
     
@@ -210,7 +226,8 @@ class OtherTimeCostModel:
                 fct_time = linear_func(args.micro_batch_size / dp_size, args.other_time_profiled[0], args.other_time_profiled[1]) / tp_size
 
             else:
-                fct_time = args.other_time_profiled * args.micro_batch_size // dp_size / tp_size
+                other_time_profiled = args.other_time_profiled if args.other_time_profiled is not None else 0.0
+                fct_time = other_time_profiled * args.micro_batch_size // dp_size / tp_size
             
             if args.pp_size == 1: # no pp, just one stage
                 self.fct[tp_size] = fct_time
