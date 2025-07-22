@@ -1,0 +1,694 @@
+import os
+import json
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+import paddle
+import paddle.distributed as dist
+from paddle import framework, core
+
+# Add NCCL environment setup for better error handling
+def setup_nccl_environment():
+    """Setup NCCL environment variables for better stability"""
+    nccl_env_vars = {
+        'NCCL_DEBUG': 'INFO',  # Enable debug info for troubleshooting
+        'NCCL_TIMEOUT': '1800',  # 30 minutes timeout
+        'NCCL_IB_DISABLE': '1',  # Disable InfiniBand (often causes issues)
+        'NCCL_P2P_DISABLE': '1',  # Disable P2P communication (can be unstable)
+        'NCCL_TREE_THRESHOLD': '0',  # Force ring algorithm
+        'NCCL_SOCKET_IFNAME': 'lo',  # Use loopback interface for single machine
+        'NCCL_BUFFSIZE': '2097152',  # 2MB buffer size
+        'NCCL_NTHREADS': '1',  # Single thread for NCCL
+    }
+    
+    for key, value in nccl_env_vars.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            logger.info(f"Set {key}={value}")
+
+from paddlenlp.ops import Topology
+from paddlenlp.trainer import AutoTrainingArguments, PdArgumentParser
+from paddlenlp.trainer.auto_trainer import AutoTrainer
+from paddlenlp.trainer.trainer_utils import IntervalStrategy, _get_distributed_seeds, ShardingOption
+from paddlenlp.transformers import (
+    CosineAnnealingWithWarmupDecay,
+    LinearAnnealingWithWarmupDecay,
+    LlamaConfig,
+    LlamaForCausalLM3DAuto,
+    LlamaForCausalLMNet,
+    LlamaPretrainingCriterion3DAuto,
+    LlamaPretrainingCriterionNet,
+)
+from paddlenlp.utils.log import logger
+
+MODEL_CLASSES = {
+    "llama": (LlamaConfig, LlamaForCausalLM3DAuto, LlamaPretrainingCriterion3DAuto),
+    "llama_network": (LlamaConfig, LlamaForCausalLMNet, LlamaPretrainingCriterionNet),
+}
+
+from paddlenlp.trainer.utils.doc import add_start_docstrings
+from paddlenlp.utils.tools import get_env_device
+
+from paddle.io import Dataset, DistributedBatchSampler
+import numpy as np
+
+from paddlenlp.experimental.galvatron.profiler.runtime_profiler import RuntimeProfilerArguments
+
+class DummyDataset(Dataset):
+    def __init__(self, vocab_size, seq_length):
+        super(DummyDataset, self).__init__()
+        self.vocab_size = vocab_size
+        self.seq_length = seq_length
+        self.generate_dummy_data()
+    
+    def generate_dummy_data(self):
+        self.dataset_size = 512 * 20 * 16  # Temporarily set to 512 × 20 × 16
+        self.input_list = []
+        self.label_list = []
+        
+        for _ in range(self.dataset_size):
+            single_sentence_length = np.random.randint(1, self.seq_length + 1) # [1, seq_length + 1)
+            input = np.random.randint(0, self.vocab_size, size=(self.seq_length,), dtype=np.int64)
+            input[single_sentence_length:] = 0
+            label = np.zeros_like(input)
+            label[:-1] = input[1:self.seq_length]
+            self.input_list.append(input)
+            self.label_list.append(label)
+    
+    def __getitem__(self, idx):
+        if idx >= self.dataset_size:
+            raise IndexError("Index out of range")
+        return {"input_ids": self.input_list[idx], "labels": self.label_list[idx]}
+    
+    def __len__(self):
+        return self.dataset_size
+
+@dataclass
+@add_start_docstrings(AutoTrainingArguments.__doc__)
+class PreTrainingArguments(AutoTrainingArguments):
+    min_learning_rate: float = field(
+        default=1e-5,
+        metadata={"help": "Minimum learning rate deacyed to."},
+    )
+    decay_steps: float = field(
+        default=None,
+        metadata={
+            "help": "The steps use to control the learing rate. If the step > decay_steps, will use the min_learning_rate."
+        },
+    )
+    enable_linear_fused_grad_add: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused linear grad add strategy, which will reduce elementwise add for grad accumulation in the backward of nn.Linear ."
+        },
+    )
+    pipeline_schedule_mode: str = field(
+        default="1F1B", metadata={"help": "The pipeline schedule mode, support FThenB, 1F1B, VPP and Eager-1F1B."}
+    )
+    sr: Optional[int] = field(default=0, metadata={"help": "The count of chunks without recompute."})
+    virtual_pipeline_seg_method: str = field(
+        default="LlamaDecoderLayerAuto", metadata={"help": "The seg method of spliting pp layer for virtual pipeline."}
+    )
+    # NOTE(gongenlei): new add autotuner_benchmark
+    autotuner_benchmark: bool = field(
+        default=False,
+        metadata={"help": "Weather to run benchmark by autotuner. True for from_scratch and pad_max_length."},
+    )
+    
+    # Layerwise cost optimization arguments
+    use_optimal_solution: bool = field(
+        default=True,
+        metadata={"help": "Whether to use optimal solution from layerwise search."},
+    )
+    optimal_solution_path: str = field(
+        default="./configs/optimal_solution.json",
+        metadata={"help": "Path to the optimal solution JSON file."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.enable_auto_parallel
+
+        # NOTE(gongenlei): new add autotuner_benchmark
+        if self.autotuner_benchmark:
+            self.max_steps = 5
+            self.do_train = True
+            self.do_export = False
+            self.do_predict = False
+            self.do_eval = False
+            self.overwrite_output_dir = True
+            self.load_best_model_at_end = False
+            self.report_to = []
+            self.save_strategy = IntervalStrategy.NO
+            self.evaluation_strategy = IntervalStrategy.NO
+
+        logger.info(self.strategy)
+
+@dataclass
+class DataArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and evaluating.
+    Using `PdArgumentParser` we can turn this class into argparse arguments to be able to
+    specify them on the command line.
+    """
+
+    input_dir: str = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    split: str = field(default="949,50,1", metadata={"help": "Train/valid/test data split."})
+
+    max_seq_length: int = field(
+        default=1024,
+        metadata={
+            "help": "The maximum total input sequence length after tokenization. Sequences longer "
+            "than this will be truncated, sequences shorter will be padded."
+        },
+    )
+    share_folder: bool = field(
+        default=False,
+        metadata={"help": "Use share folder for data dir and output dir on multi machine."},
+    )
+
+    data_impl: str = field(default="mmap", metadata={"help": "The format of the preprocessed data."})
+    skip_warmup: bool = field(
+        default=True,
+        metadata={"help": "Whether to skip the warmup process of mmap files."},
+    )
+    data_cache: str = field(default=None, metadata={"help": "The path of the cached dataset."})
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to pre-train from.
+    """
+
+    model_type: Optional[str] = field(
+        default="llama", metadata={"help": "Only support for llama pre-training for now."}
+    )
+    model_name_or_path: str = field(
+        default="__internal_testing__/tiny-random-llama",
+        metadata={
+            "help": "Path to pretrained model or model identifier from https://paddlenlp.readthedocs.io/zh/latest/model_zoo/transformers.html"
+        },
+    )
+    tokenizer_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+
+    use_fast_layer_norm: bool = field(
+        default=False,
+        metadata={"help": "GPT3 model, use fast layernorm"},
+    )
+
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    vocab_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": ".Vocabulary size of the Llama model. Defines the number of different tokens that can be represented by the `inputs_ids`"
+        },
+    )
+    hidden_size: Optional[int] = field(default=None, metadata={"help": "Dimension of the hidden representations."})
+    seq_length: Optional[int] = field(default=None, metadata={"help": "sequence length."})
+    intermediate_size: Optional[int] = field(default=None, metadata={"help": "Dimension of the MLP representations."})
+    num_hidden_layers: Optional[int] = field(
+        default=None, metadata={"help": "Number of hidden layers in the Transformer encoder."}
+    )
+    num_attention_heads: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of attention heads for each attention layer in the Transformer encoder."},
+    )
+    use_flash_attention: bool = field(
+        default=False,
+        metadata={"help": "use_flash_attention"},
+    )
+    use_fused_rms_norm: bool = field(
+        default=False,
+        metadata={"help": "llama, use_fused_rms_norm"},
+    )
+    fuse_attention_qkv: bool = field(
+        default=False,
+        metadata={"help": "whether to fuse attention qkv"},
+    )
+    fuse_attention_ffn: bool = field(
+        default=False,
+        metadata={"help": "whether to fuse first up and gate proj in mlp block"},
+    )
+    recompute_granularity: str = field(
+        default="full",
+        metadata={"help": "Choose among ['full', 'core_attn', 'full_attn']"},
+    )
+    virtual_pp_degree: int = field(
+        default=1,
+        metadata={"help": "virtual_pp_degree"},
+    )
+    continue_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Pre-training from existing paddlenlp model weights. Default False and model will train from scratch. If set True, the model_name_or_path argument must exist in the paddlenlp models."
+        },
+    )
+    use_fused_rope: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable rope fusion or not."},
+    )
+    no_recompute_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={"help": "Specify the full transformer layers that should not be recomputed."},
+    )
+    pp_recompute_interval: int = field(
+        default=1,
+        metadata={
+            "help": "The interval for the number of layers at which recomputation occurs. A value of 0 indicates no recomputation. Default is 0."
+        },
+    )
+    recompute_use_reentrant: bool = field(
+        default=False,
+        metadata={"help": "recompute_use_reentrant"},
+    )
+
+def load_optimal_solution(optimal_solution_path):
+    """Load optimal solution from JSON file"""
+    if not os.path.exists(optimal_solution_path):
+        logger.warning(f"Optimal solution file not found: {optimal_solution_path}")
+        return None
+    
+    try:
+        with open(optimal_solution_path, 'r') as f:
+            optimal_solution = json.load(f)
+        logger.info(f"✅ Loaded optimal solution from: {optimal_solution_path}")
+        return optimal_solution
+    except Exception as e:
+        logger.error(f"❌ Failed to load optimal solution: {e}")
+        return None
+
+def apply_optimal_solution(training_args, model_args, optimal_solution):
+    """Apply optimal solution configuration to training and model arguments"""
+    if optimal_solution is None:
+        logger.warning("No optimal solution available, using default configuration")
+        return
+    
+    strategy_config = optimal_solution.get('strategy', {})
+    performance_metrics = optimal_solution.get('performance_metrics', {})
+    
+    # Apply parallelism configuration
+    if 'pp_size' in strategy_config:
+        training_args.pipeline_parallel_degree = strategy_config['pp_size']
+        logger.info(f"🔄 Pipeline parallel degree: {strategy_config['pp_size']}")
+    
+    if 'tp_size' in strategy_config:
+        training_args.tensor_parallel_degree = strategy_config['tp_size']
+        logger.info(f"⚙️  Tensor parallel degree: {strategy_config['tp_size']}")
+    
+    if 'dp_size' in strategy_config:
+        # dp_size is handled automatically by world_size / (pp_size * tp_size)
+        calculated_dp_size = training_args.world_size // (training_args.pipeline_parallel_degree * training_args.tensor_parallel_degree)
+        logger.info(f"📊 Data parallel degree: {calculated_dp_size} (calculated from world_size)")
+    
+    if 'sharding_stage' in strategy_config:
+        sharding_stage = strategy_config['sharding_stage']
+        if sharding_stage == 0:
+            training_args.sharding_parallel_degree = 1
+            # Fix: Use setattr to set sharding as empty list (no sharding)
+            setattr(training_args, 'sharding', [])
+        elif sharding_stage == 2:
+            training_args.sharding_parallel_degree = calculated_dp_size
+            # Fix: Convert string to ShardingOption list (same as train_with_cost.py)
+            sharding_str = "stage2"
+            setattr(training_args, 'sharding', [ShardingOption(s) for s in sharding_str.split()])
+        elif sharding_stage == 3:
+            training_args.sharding_parallel_degree = calculated_dp_size
+            # Fix: Convert string to ShardingOption list (same as train_with_cost.py)
+            sharding_str = "stage3"
+            setattr(training_args, 'sharding', [ShardingOption(s) for s in sharding_str.split()])
+        logger.info(f"🔄 Sharding stage: {sharding_stage}")
+    
+    # Apply batch size configuration
+    if 'batch_size' in optimal_solution:
+        batch_size = optimal_solution['batch_size']
+        accumulation_steps = optimal_solution.get('accumulation_steps', 1)
+        
+        # Calculate per_device_train_batch_size
+        total_devices = training_args.world_size
+        if hasattr(training_args, 'sharding_parallel_degree') and training_args.sharding_parallel_degree > 1:
+            # With sharding, effective data parallel size is world_size / (pp_size * tp_size)
+            effective_dp_size = calculated_dp_size
+        else:
+            effective_dp_size = training_args.world_size // (training_args.pipeline_parallel_degree * training_args.tensor_parallel_degree)
+        
+        per_device_batch_size = batch_size // (effective_dp_size * accumulation_steps)
+        training_args.per_device_train_batch_size = max(1, per_device_batch_size)
+        training_args.gradient_accumulation_steps = accumulation_steps
+        
+        logger.info(f"📦 Global batch size: {batch_size}")
+        logger.info(f"🔢 Accumulation steps: {accumulation_steps}")
+        logger.info(f"📊 Per device batch size: {training_args.per_device_train_batch_size}")
+    
+    # Apply recompute configuration (following train_with_cost.py logic)
+    if 'recompute' in strategy_config:
+        recompute_flag = strategy_config['recompute']
+        # Handle both boolean and integer values
+        recompute_enabled = bool(recompute_flag) if isinstance(recompute_flag, bool) else recompute_flag > 0
+        
+        # Check layerwise recompute to ensure we have segments to recompute
+        if recompute_enabled and 'layerwise_recompute' in strategy_config:
+            layerwise_recompute = strategy_config['layerwise_recompute']
+            if layerwise_recompute:
+                recompute_count = sum(layerwise_recompute)
+                total_layers = len(layerwise_recompute)
+                
+                # If no layers are set for recompute, disable global recompute to avoid PIR pass error
+                if recompute_count == 0:
+                    recompute_enabled = False
+                    logger.info(f"🔄 Disabling recompute: no layers specified for recompute in layerwise pattern")
+                else:
+                    # Convert layerwise_recompute to no_recompute_layers
+                    no_recompute_layers = [i for i, recompute in enumerate(layerwise_recompute) if recompute == 0]
+                    if no_recompute_layers and len(no_recompute_layers) < total_layers:
+                        # Only set no_recompute_layers if some (but not all) layers are excluded
+                        model_args.no_recompute_layers = no_recompute_layers
+                        logger.info(f"🔧 Layerwise recompute pattern: {layerwise_recompute}")
+                        logger.info(f"🚫 No recompute layers: {no_recompute_layers}")
+                    
+                    # Display recompute pattern
+                    pattern_str = ''.join(['R' if x == 1 else 'N' for x in layerwise_recompute])
+                    recompute_ratio = (recompute_count / total_layers * 100) if total_layers > 0 else 0
+                    logger.info(f"📈 Recompute pattern: {pattern_str} (R=Recompute, N=Normal)")
+                    logger.info(f"📊 Recompute ratio: {recompute_count}/{total_layers} ({recompute_ratio:.1f}%)")
+        
+        training_args.recompute = recompute_enabled
+        logger.info(f"🧠 Final recompute setting: {recompute_enabled}")
+        
+        if not recompute_enabled:
+            # Ensure no layerwise configuration is set when recompute is disabled
+            model_args.no_recompute_layers = None
+            logger.info(f"🔄 Recompute disabled - no layerwise configuration needed")
+    
+    # Log performance metrics
+    if performance_metrics:
+        throughput = performance_metrics.get('throughput_samples_per_sec', 0)
+        memory_usage = performance_metrics.get('memory_usage_gb', [0])[0] if performance_metrics.get('memory_usage_gb') else 0
+        logger.info(f"🚀 Expected throughput: {throughput:.2f} samples/s")
+        logger.info(f"💾 Expected memory usage: {memory_usage:.1f}GB")
+    
+    # Display optimal strategy summary
+    strategy_name = strategy_config.get('strategy_name', 'Unknown')
+    logger.info(f"🎯 Optimal strategy applied: {strategy_name}")
+
+def create_dataset(vocab_size=32000, seq_length=1024):
+    train_dataset = DummyDataset(vocab_size, seq_length)
+    
+    from paddlenlp.data import Stack
+    def dummy_collate_fn(data):
+        stack_fn = Stack()
+        input_ids = stack_fn([x["input_ids"] for x in data])
+        labels = stack_fn([x["labels"] for x in data])
+        return {"input_ids": input_ids, "labels": labels}
+    
+    return train_dataset, dummy_collate_fn
+
+class PretrainingTrainer(AutoTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_pretraining = True
+
+    def _wrap_for_dist_loader(self, train_dataloader):
+        dist_loader = super()._wrap_for_dist_loader(train_dataloader)
+        dist_loader._input_keys = ["input_ids", "labels"]
+        return dist_loader
+
+    def _get_train_sampler(self) -> Optional[paddle.io.Sampler]:
+        if self.train_dataset is None:
+            return None
+
+        total_batch_size_per_acc_step = self.args.per_device_train_batch_size * self.args.dataset_world_size  # per_device_train_batch_size是mbsz dataset_world_size是dp*sdp
+        total_batch_size = total_batch_size_per_acc_step
+
+        # In llm/llama/run_pretrain.py, it uses paddlenlp.utils.batch_sampler.DistributedBatchSampler,
+        # which does no shuffle when shuffle is set True.
+        sampler = paddle.io.BatchSampler(
+            dataset=self.train_dataset,
+            shuffle=False,
+            batch_size=total_batch_size,
+            drop_last=self.args.dataloader_drop_last,
+        )
+        sampler._acc_steps = self.args.gradient_accumulation_steps
+        return sampler
+
+def init_seed(seed: int = 1234, args=None):
+    if args is None:
+        random.seed(seed)
+        np.random.seed(seed)
+        paddle.seed(seed)
+    else:
+        assert not args.use_hybrid_parallel and args.enable_auto_parallel
+        if dist.get_world_size() > 1:
+            if args.hybrid_parallel_topo_order is None or args.hybrid_parallel_topo_order == "pp_first":
+                order = ["pp", "dp", "sharding", "mp", "sep"]
+            elif args.hybrid_parallel_topo_order == "sharding_first":
+                order = ["dp", "sharding", "pp", "mp", "sep"]
+            topo = Topology(
+                dist.get_rank(),
+                dist.get_world_size(),
+                dp_degree=args.dataset_world_size,
+                pp_degree=args.pipeline_parallel_degree,
+                mp_degree=args.tensor_parallel_degree,
+                sharding_degree=1,  # auto_parallel's sharding is not orthogonal with dp, mp and pp
+                order=order,
+            )
+
+            global_seed, local_seed, random_seed = _get_distributed_seeds(args.seed, topo)
+
+            random_seed = random_seed.item()
+            paddle.seed(local_seed)
+            print(f"DEBUG: random_seed = {random_seed}, type = {type(random_seed)}")
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+
+            logger.info(
+                "The global seed is set to {}, local seed is set to {} and "
+                "random seed is set to {}.".format(global_seed, local_seed, random_seed)
+            )
+        else:
+            random.seed(args.seed)
+            np.random.seed(args.seed)
+            paddle.seed(args.seed)
+
+def runtime_profiler_initalize_manully(runtime_profiler_args:RuntimeProfilerArguments, training_args, model_args):
+    runtime_profiler_args.global_rank = dist.get_rank()
+    runtime_profiler_args.pp_degree = training_args.pipeline_parallel_degree
+    runtime_profiler_args.tp_degree = training_args.tensor_parallel_degree
+    runtime_profiler_args.dp_degree = training_args.dataset_world_size
+    runtime_profiler_args.runtime_profiler_to_static = training_args.to_static
+    runtime_profiler_args.runtime_profiler_recompute = training_args.recompute
+    
+    runtime_profiler_args.dp_rank = training_args.dataset_rank
+    runtime_profiler_args.tp_rank = training_args.tensor_parallel_rank
+    runtime_profiler_args.pp_rank = training_args.pipeline_parallel_rank
+
+    runtime_profiler_args.model_name = "llama"
+    runtime_profiler_args.layernum = model_args.num_hidden_layers
+    runtime_profiler_args.seq_len = model_args.seq_length
+    runtime_profiler_args.global_batch_size = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * training_args.dataset_world_size
+    runtime_profiler_args.mixed_precision = 'bf16' if training_args.bf16 else 'fp16' if training_args.fp16 else 'fp32'
+
+def main():
+    parser = PdArgumentParser((ModelArguments, DataArguments, PreTrainingArguments, RuntimeProfilerArguments))
+    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
+        model_args, data_args, training_args, runtime_profiler_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+    else:
+        model_args, data_args, training_args, runtime_profiler_args = parser.parse_args_into_dataclasses()
+
+    if data_args.data_cache is not None:
+        os.makedirs(data_args.data_cache, exist_ok=True)
+
+    # Setup NCCL environment before any distributed operations
+    setup_nccl_environment()
+
+    # Load and apply optimal solution before initializing
+    if training_args.use_optimal_solution:
+        logger.info("🔍 Loading optimal solution from layerwise cost search...")
+        optimal_solution = load_optimal_solution(training_args.optimal_solution_path)
+        apply_optimal_solution(training_args, model_args, optimal_solution)
+    else:
+        logger.info("ℹ️  Using manual configuration (optimal solution disabled)")
+
+    init_seed(args=training_args)
+    paddle.set_device(training_args.device)
+    
+    # Enhanced distributed initialization with error handling
+    if paddle.distributed.get_world_size() > 1:
+        try:
+            logger.info("Initializing distributed environment...")
+            paddle.distributed.init_parallel_env()
+            logger.info("✅ Distributed environment initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize distributed environment: {e}")
+            logger.info("🔧 Trying alternative initialization...")
+            # Try with reduced timeout
+            os.environ['NCCL_TIMEOUT'] = '600'  # 10 minutes
+            paddle.distributed.init_parallel_env()
+            logger.info("✅ Alternative distributed initialization successful")
+
+    # Log model and data config
+    runtime_profiler_initalize_manully(runtime_profiler_args, training_args, model_args)
+    training_args.print_config(model_args, "Model")
+    training_args.print_config(data_args, "Data")
+    training_args.print_config(training_args, "Training")
+    training_args.print_config(runtime_profiler_args, "RuntimeProfile")
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, world_size: {training_args.world_size}, "
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16 or training_args.bf16}"
+    )
+
+    config_class, model_class, criterion_class = MODEL_CLASSES[model_args.model_type]
+
+    config = config_class()
+    config.num_hidden_layers = model_args.num_hidden_layers
+    config.intermediate_size = model_args.intermediate_size
+    config.vocab_size = model_args.vocab_size
+    config.hidden_size = model_args.hidden_size
+    config.seq_length = model_args.seq_length
+    config.max_position_embeddings = config.seq_length
+    config.num_attention_heads = model_args.num_attention_heads
+    config.use_fast_layer_norm = model_args.use_fast_layer_norm
+    if model_args.no_recompute_layers is not None:
+        model_args.no_recompute_layers.sort()
+    config.use_flash_attention = model_args.use_flash_attention
+    config.use_fused_rms_norm = model_args.use_fused_rms_norm
+    config.fuse_attention_qkv = model_args.fuse_attention_qkv
+    config.fuse_attention_ffn = model_args.fuse_attention_ffn
+    config.recompute_granularity = model_args.recompute_granularity
+    config.virtual_pp_degree = model_args.virtual_pp_degree
+    config.sequence_parallel = training_args.sequence_parallel
+    config.fuse_sequence_parallel_allreduce = training_args.fuse_sequence_parallel_allreduce
+    config.use_fused_rope = model_args.use_fused_rope
+    config.no_recompute_layers = model_args.no_recompute_layers
+    config.pp_recompute_interval = model_args.pp_recompute_interval
+    config.recompute_use_reentrant = model_args.recompute_use_reentrant
+    config.use_recompute = training_args.recompute
+    config.tensor_parallel_degree = training_args.tensor_parallel_degree
+    config.tensor_parallel_rank = training_args.tensor_parallel_rank
+    config.sharding_parallel_degree = training_args.sharding_parallel_degree
+    
+    # Log the final recompute configuration
+    logger.info(f"🔧 Final config - use_recompute: {config.use_recompute}, no_recompute_layers: {config.no_recompute_layers}")
+    if training_args.strategy.pipeline.enable and config.virtual_pp_degree > 1:
+        pipeline = training_args.strategy.pipeline
+        pipeline.vpp_degree = config.virtual_pp_degree
+        pipeline.vpp_seg_method = training_args.virtual_pipeline_seg_method
+
+    print("[auto-parallel] Model Config:", config)
+
+    with paddle.LazyGuard():
+        model = model_class.from_config(config, dtype="float32")
+        criterion = criterion_class(config)
+
+    print("[auto-parallel] Model initialized")
+    print(f'model is {model}')
+
+    if training_args.recompute: # As described in the corresponding model definition, Recompute defaults to False and is controlled by Trainer
+        # Check if we have any layers that should actually be recomputed
+        total_layers = model_args.num_hidden_layers
+        no_recompute_layers = model_args.no_recompute_layers or []
+        
+        # If all layers are marked as no_recompute, disable recompute to avoid PIR pass errors
+        if len(no_recompute_layers) >= total_layers:
+            logger.warning(f"⚠️ All {total_layers} layers are marked as no_recompute, disabling global recompute")
+            training_args.recompute = False
+            config.use_recompute = False  # Also update config
+        else:
+            def fn(layer):
+                if hasattr(layer, "enable_recompute") and (layer.enable_recompute is False or layer.enable_recompute == 0):
+                    layer.enable_recompute = True
+            model.apply(fn)
+            logger.info(f"🧠 Applied recompute to model layers (excluding {len(no_recompute_layers)} no-recompute layers)")
+    else:
+        logger.info(f"🔄 Recompute is disabled globally")
+
+    # Create the learning_rate scheduler and optimizer
+    if training_args.decay_steps is None:
+        training_args.decay_steps = training_args.max_steps
+
+    if training_args.warmup_steps > 0:
+        warmup_steps = training_args.warmup_steps
+    else:
+        warmup_steps = training_args.warmup_ratio * training_args.max_steps
+
+    lr_scheduler = None
+    if training_args.lr_scheduler_type.value == "cosine":
+        lr_scheduler = CosineAnnealingWithWarmupDecay(
+            max_lr=training_args.learning_rate,
+            min_lr=training_args.min_learning_rate,
+            warmup_step=warmup_steps,
+            decay_step=training_args.decay_steps,
+            last_epoch=0,
+        )
+    elif training_args.lr_scheduler_type.value == "linear":
+        lr_scheduler = LinearAnnealingWithWarmupDecay(
+            max_lr=training_args.learning_rate,
+            min_lr=training_args.min_learning_rate,
+            warmup_step=warmup_steps,
+            decay_step=training_args.decay_steps,
+            last_epoch=0,
+        )
+    
+    train_dataset, data_collator = create_dataset(config.vocab_size, config.seq_length)
+    
+    # [workflow] 以下为模型封装代码
+    trainer = PretrainingTrainer(
+        model=model,
+        criterion=criterion,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=train_dataset,
+        eval_dataset=None,
+        optimizers=(None, lr_scheduler),
+        runtime_profiler_args=runtime_profiler_args,
+    )
+    print("[auto-parallel] PretrainingTrainer OK")    
+    
+    print('After model initialization, current allocated memory')
+    current_device = framework._current_expected_place_()
+    max_memory_allocated = core.device_memory_stat_peak_value("Allocated", current_device.get_device_id()) / 2**20
+    current_memory_allocated = core.device_memory_stat_current_value("Allocated", current_device.get_device_id()) / 2**20
+    print(f"Max memory allocated: {max_memory_allocated} MB")
+    print(f"Current memory allocated: {current_memory_allocated} MB")
+    
+    # Check memory usage before training
+    available_memory = paddle.device.cuda.memory_reserved() / 1024**2 if paddle.is_compiled_with_cuda() else 0
+    if available_memory > 0:
+        memory_usage_ratio = current_memory_allocated / available_memory
+        logger.info(f"💾 Memory usage: {current_memory_allocated:.1f}MB / {available_memory:.1f}MB ({memory_usage_ratio*100:.1f}%)")
+        if memory_usage_ratio > 0.9:
+            logger.warning("⚠️ High memory usage detected! Consider reducing batch size.")
+    
+    # Training
+    if training_args.do_train:
+        try:
+            logger.info("🚀 Starting training...")
+            # Force a small barrier to ensure all processes are ready
+            if paddle.distributed.get_world_size() > 1:
+                logger.info("🔄 Synchronizing processes before training...")
+                paddle.distributed.barrier()
+                logger.info("✅ All processes synchronized")
+            
+            train_result = trainer.train(resume_from_checkpoint=None)
+            logger.info("✅ Training completed successfully")
+        except Exception as e:
+            logger.error(f"❌ Training failed with error: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            # Try to clean up CUDA memory
+            if paddle.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+                logger.info("🧹 Cleared CUDA cache")
+            raise
+        
+if __name__ == "__main__":
+    main() 

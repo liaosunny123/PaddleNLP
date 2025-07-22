@@ -4,7 +4,7 @@ import numpy as np
 
 @dataclass
 class MemoryCostModelArguments:
-    strategy: Strategy = field(default_factory=lambda: Strategy(), metadata={"help": "The strategy of the model."})
+    strategy: Strategy = field(default=None, metadata={"help": "The strategy of the model."})
     global_batch_size: int = field(default=8, metadata={"help": "The global batch size of the model."})
     mixed_precision_type: str = field(default='fp16', metadata={"help": "The mixed precision type of the model."})
     stage_idx: int = field(default=0, metadata={"help": "The stage index of the model."})
@@ -37,15 +37,10 @@ class MemoryCostModel:
         self.recompute = strategy.recompute
         
         self.local_batch_size = args.global_batch_size // self.dp_size
-        
-        # chunk_like_torch now handles all cases properly, including when local_batch_size < accumulation_steps
         microbatches = [t.shape[0] for t in chunk_like_torch(self.local_batch_size, args.accumulation_steps)]
-        
-        # Ensure we have exactly accumulation_steps microbatches
-        assert len(microbatches) == args.accumulation_steps, f'Expected {args.accumulation_steps} microbatches, got {len(microbatches)}'
+        assert args.accumulation_steps == len(microbatches), f'Accumulation steps should be equal to the length of microbatches, but got {args.accumulation_steps} and {len(microbatches)}'
         end = self.pp_size - args.stage_idx if self.pp_size - args.stage_idx <= args.accumulation_steps else args.accumulation_steps
-        total_microbatches = np.sum(microbatches)
-        self.act_1f1b_ratio = np.sum(microbatches[:end]) / total_microbatches if end > 0 and total_microbatches > 0 else 0.0
+        self.act_1f1b_ratio = np.sum(microbatches[:end]) / np.sum(microbatches) if end > 0 else 0.0
         self.local_batch_size *= self.act_1f1b_ratio
         # print(f'local batch size: {self.local_batch_size}, act_1f1b_ratio: {self.act_1f1b_ratio}')
 
@@ -77,28 +72,7 @@ class MemoryCostModel:
     def estimate_activation_size(self):
         args = self.args
         if self.recompute:
-            # For recompute, we always use full granularity
-            # The memory usage depends on how many layers are actually recomputed
-            strategy = args.strategy
-            
-            # Calculate base activation memory (for full recompute scenario)
-            base_checkpoint_activation = args.tp_activation_per_bsz_dict.get('checkpoint', 
-                                         args.tp_activation_per_bsz_dict[self.tp_size] * 0.5)
-            base_normal_activation = args.tp_activation_per_bsz_dict[self.tp_size]
-            
-            # Calculate recompute ratio based on layerwise_recompute
-            recompute_ratio = 1.0  # Default to full recompute
-            if hasattr(strategy, 'layerwise_recompute') and strategy.layerwise_recompute:
-                total_layers = len(strategy.layerwise_recompute)
-                recompute_layers = sum(strategy.layerwise_recompute)
-                recompute_ratio = recompute_layers / total_layers if total_layers > 0 else 1.0
-            
-            # Calculate activation size based on recompute ratio
-            # Memory usage is a weighted average of checkpoint and normal activation
-            checkpoint_activation = base_checkpoint_activation * recompute_ratio
-            normal_activation = base_normal_activation * (1 - recompute_ratio)
-            self.activation_size = (checkpoint_activation + normal_activation) * self.local_batch_size
-                
+            self.activation_size = args.tp_activation_per_bsz_dict['checkpoint'] * self.local_batch_size
             # NOTE adjust for sequence parallelism(Megatron-LM SP)
             self.activation_size /= self.tp_size 
         else:
@@ -180,7 +154,7 @@ class OtherMemoryCostModel:
                 tp_other_memory_cost[-1] = args.other_memory_pp_on['last_stage']['model_states'][tp_size] * self.zero_ratio(dp_size) + args.other_memory_pp_on['last_stage']['activation'][tp_size] * other_layers_bsz_last
             
             for i in range(len(tp_other_memory_cost)):
-                tp_other_memory_cost[i] += int(args.paddle_context_memory)
+                tp_other_memory_cost[i] += args.paddle_context_memory
             
             self.other_memory_cost[tp_size] = tp_other_memory_cost
             
@@ -193,25 +167,17 @@ def chunk_like_torch(size, chunks):
     if chunks <= 0:
         raise ValueError("chunks must be positive")
     
-    if size <= 0:
-        # Return empty chunks if size is 0 or negative
-        return [np.array([], dtype=int) for _ in range(chunks)]
-    
-    # When size < chunks, we can only create 'size' number of non-empty chunks
-    effective_chunks = min(size, chunks)
-    chunk_size = (size + effective_chunks - 1) // effective_chunks  # ceiling division
+    chunk_size = (size + chunks - 1) // chunks  # ceiling division
     
     # Create splits
     splits = []
-    for i in range(effective_chunks):
+    for i in range(chunks):
         start = i * chunk_size
         if start >= size:
-            break
-        end = min(start + chunk_size, size)
-        splits.append(np.arange(start, end))
-    
-    # Add empty chunks if needed to match the requested number of chunks
-    while len(splits) < chunks:
-        splits.append(np.array([], dtype=int))
+            # Return empty array for remaining chunks
+            splits.append(np.array([], dtype=int))
+        else:
+            end = min(start + chunk_size, size)
+            splits.append(np.arange(start, end))
     
     return splits

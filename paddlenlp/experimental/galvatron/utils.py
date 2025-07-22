@@ -34,15 +34,13 @@ class Strategy:
     dp_size: int = field(default=1, metadata={"help": "The number of data parallelism to use."})
     sharding_stage: int = field(default=0, metadata={"help": "The stage of sharding. 0: no sharding, 1: sharding1, 2: sharding2, 3: sharding3"})
     recompute: int = field(default=0, metadata={"help": "Whether to use recompute."})
-    
-    # Fine-grained recompute parameters
-    recompute_granularity: str = field(default="full", metadata={"help": "Recompute granularity: full, core_attn, full_attn"})
-    no_recompute_layers: List[int] = field(default_factory=list, metadata={"help": "Layers to exclude from recompute"})
-    pp_recompute_interval: int = field(default=0, metadata={"help": "Pipeline recompute interval"})
-    layerwise_recompute: List[int] = field(default_factory=list, metadata={"help": "Layer-wise recompute pattern: [0,1,1,0] means layer 0,3 no recompute, layer 1,2 recompute"})
+    layerwise_recompute: List[int] = field(default_factory=list, metadata={"help": "Layerwise recompute configuration. List of 0/1 for each layer."})
     
     def serialize(self):
         text = f'pp{self.pp_size}_tp{self.tp_size}_dp{self.dp_size}_stage{self.sharding_stage}_recompute{self.recompute}'
+        if self.layerwise_recompute:
+            layerwise_str = ''.join(map(str, self.layerwise_recompute))
+            text += f'_layerwise{layerwise_str}'
         return text
     
     def deserialize(self, text):
@@ -57,22 +55,68 @@ class Strategy:
                     self.dp_size = int(item.split('dp')[1])
                 elif 'stage' in item:
                     self.sharding_stage = int(item.split('stage')[1])
-                elif 'recompute' in item:
+                elif 'recompute' in item and not 'layerwise' in item:
                     self.recompute = int(item.split('recompute')[1])
+                elif 'layerwise' in item:
+                    layerwise_str = item.split('layerwise')[1]
+                    self.layerwise_recompute = [int(x) for x in layerwise_str]
         elif isinstance(text, dict):
             self.pp_size = text.get('pp_size', self.pp_size)
             self.tp_size = text.get('tp_size', self.tp_size)
             self.dp_size = text.get('dp_size', self.dp_size)
             self.sharding_stage = text.get('sharding_stage', self.sharding_stage)
             self.recompute = text.get('recompute', self.recompute)
+            self.layerwise_recompute = text.get('layerwise_recompute', self.layerwise_recompute)
         elif isinstance(text, List):
-            self.pp_size = text[0]
-            self.tp_size = text[1]
-            self.dp_size = text[2]
-            self.sharding_stage = text[3]
-            self.recompute = text[4]
+            if len(text) >= 5:
+                self.pp_size = text[0]
+                self.tp_size = text[1]
+                self.dp_size = text[2]
+                self.sharding_stage = text[3]
+                self.recompute = text[4]
+                if len(text) > 5:
+                    self.layerwise_recompute = text[5] if isinstance(text[5], list) else []
         else:
             raise ValueError("Unsupported type for deserialization. Supported types are str, dict, and list.")
+    
+    def get_layerwise_recompute_count(self):
+        """Get the number of layers with recompute enabled"""
+        return sum(self.layerwise_recompute) if self.layerwise_recompute else 0
+    
+    def set_layerwise_recompute(self, total_layers, recompute_count):
+        """Set layerwise recompute pattern: first recompute_count layers enabled, rest disabled"""
+        if recompute_count > total_layers:
+            recompute_count = total_layers
+        self.layerwise_recompute = [1] * recompute_count + [0] * (total_layers - recompute_count)
+        # Update the global recompute flag based on whether any layer has recompute
+        self.recompute = 1 if recompute_count > 0 else 0
+    
+    def get_recompute_efficiency_info(self):
+        """Get efficiency information about the recompute configuration"""
+        if not self.layerwise_recompute:
+            return {"enabled": False, "total_layers": 0, "recompute_layers_count": 0, "recompute_ratio": "0%"}
+        
+        total_layers = len(self.layerwise_recompute)
+        recompute_count = self.get_layerwise_recompute_count()
+        recompute_ratio = f"{(recompute_count / total_layers * 100):.1f}%" if total_layers > 0 else "0%"
+        
+        # Generate efficiency explanation
+        if recompute_count == 0:
+            explanation = "No recompute - best performance, highest memory usage"
+        elif recompute_count == total_layers:
+            explanation = "Full recompute - lowest memory usage, slower performance"
+        else:
+            explanation = f"Selective recompute - balanced memory-performance trade-off"
+            
+        return {
+            "enabled": recompute_count > 0,
+            "total_layers": total_layers,
+            "recompute_layers_count": recompute_count,
+            "recompute_ratio": recompute_ratio,
+            "efficiency_explanation": explanation,
+            "layerwise_recompute_layers": [i for i, x in enumerate(self.layerwise_recompute) if x == 1],
+            "layerwise_no_recompute_layers": [i for i, x in enumerate(self.layerwise_recompute) if x == 0]
+        }
     
     def __str__(self):
         return self.serialize()
